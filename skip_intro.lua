@@ -39,14 +39,6 @@ options.read_options(opts, "skip_intro")
 -- ── Endpoints ──────────────────────────────────────────────
 local TVMAZE_SEARCH   = "https://api.tvmaze.com/search/shows?q=%s"
 local TVMAZE_EPISODES = "https://api.tvmaze.com/shows/%d/episodes"
-
--- IntroDB : structure reelle de la reponse :
--- {
---   "imdb_id": "tt0388629",
---   "season": 16, "episode": 23,
---   "intro": { "start_sec": 4.774, "end_sec": 94.774, ... },
---   "recap": null, "outro": null
--- }
 local INTRODB_URL = "https://api.introdb.app/segments?imdb_id=%s&season=%d&episode=%d&segment_type=intro"
 
 -- ── Etat global ────────────────────────────────────────────
@@ -126,14 +118,12 @@ local function parse_filepath(path)
     log("debug", "Dossier  : %s", folder)
     log("debug", "Fichier  : %s", filename)
 
-    -- Saison depuis le dossier (source fiable pour IntroDB)
     local folder_season_str = folder:match("[Ss](%d+)")
     local folder_season     = folder_season_str and tonumber(folder_season_str) or nil
 
     local show_raw, file_season, episode
     local is_absolute = false
 
-    -- SxxExx
     local s, e = filename:match("[Ss](%d+)[Ee](%d+)")
     if s then
         file_season  = tonumber(s)
@@ -142,7 +132,6 @@ local function parse_filepath(path)
         is_absolute  = false
     end
 
-    -- NxNN
     if not file_season then
         s, e = filename:match("(%d+)x(%d+)")
         if s then
@@ -153,7 +142,6 @@ local function parse_filepath(path)
         end
     end
 
-    -- Exx seul -> episode ABSOLU
     if not file_season then
         e = filename:match("[Ee](%d+)")
         if e then
@@ -189,62 +177,74 @@ local function parse_filepath(path)
 end
 
 -- ── TVMaze : recherche → TVMaze show ID + imdbID ───────────
+--
+--  Priorites de selection :
+--    1. Correspondance exacte du nom (insensible a la casse)
+--    2. Parmi les correspondances exactes, le show le plus recent
+--    3. Si aucune correspondance exacte, premier resultat avec IMDB ID valide
+--       (le plus recent en premier)
+--
 local function tvmaze_search(show_name)
     local url  = string.format(TVMAZE_SEARCH, urlencode(show_name))
     local body = http_get(url)
     if not body or body == "" then return nil, nil end
 
-    local best_tvmaze_id = nil
-    local best_imdb      = nil
-    local best_year      = 9999
-    local best_is_anim   = false
+    local search_lower = show_name:lower()
+    local candidates   = {}
 
     for show_block in body:gmatch('"show"%s*:%s*(%b{})') do
         local id_str    = show_block:match('"id"%s*:%s*(%d+)')
         local tvmaze_id = id_str and tonumber(id_str) or nil
         local imdb      = jget_str(show_block, "imdb")
-        local premiered = jget_str(show_block, "premiered") or "9999"
+        local premiered = jget_str(show_block, "premiered") or "0000"
         local stype     = jget_str(show_block, "type") or ""
         local name      = jget_str(show_block, "name") or ""
-        local year      = tonumber(premiered:match("^(%d%d%d%d)")) or 9999
-        local is_anim   = stype:lower() == "animation"
+        local year      = tonumber(premiered:match("^(%d%d%d%d)")) or 0
 
         log("debug", "  TVMaze candidat: id=%s '%s' (%s %d) imdb=%s",
             tostring(tvmaze_id), name, stype, year, imdb or "nil")
 
         if tvmaze_id and imdb and imdb:match("^tt%d+") then
-            local better = false
-            if not best_tvmaze_id then
-                better = true
-            elseif is_anim and not best_is_anim then
-                better = true
-            elseif is_anim == best_is_anim and year < best_year then
-                better = true
-            end
-            if better then
-                best_tvmaze_id = tvmaze_id
-                best_imdb      = imdb
-                best_year      = year
-                best_is_anim   = is_anim
-            end
+            local exact = (name:lower() == search_lower)
+            table.insert(candidates, {
+                tvmaze_id = tvmaze_id,
+                imdb      = imdb,
+                name      = name,
+                year      = year,
+                stype     = stype,
+                exact     = exact,
+            })
         end
     end
 
-    if best_tvmaze_id then
-        log("info", "TVMaze -> id=%d  imdbID=%s  animation=%s  annee=%d",
-            best_tvmaze_id, best_imdb, tostring(best_is_anim), best_year)
-    else
-        log("warn", "TVMaze : aucun resultat pour '%s'", show_name)
+    if #candidates == 0 then
+        log("warn", "TVMaze : aucun resultat valide pour '%s'", show_name)
+        return nil, nil
     end
-    return best_tvmaze_id, best_imdb
+
+    -- Tri : correspondances exactes d'abord, puis par annee decroissante
+    -- Le show le plus recent prime (evite de choisir un vieux homonyme)
+    table.sort(candidates, function(a, b)
+        if a.exact ~= b.exact then
+            return a.exact  -- true (exact) avant false (non-exact)
+        end
+        return a.year > b.year  -- plus recent en premier
+    end)
+
+    local best = candidates[1]
+    log("info", "TVMaze -> id=%d  imdbID=%s  '%s'  %s  annee=%d  exact=%s",
+        best.tvmaze_id, best.imdb, best.name, best.stype,
+        best.year, tostring(best.exact))
+
+    if not best.exact then
+        log("warn", "TVMaze : pas de correspondance exacte pour '%s' -> utilise '%s' (%d)",
+            show_name, best.name, best.year)
+    end
+
+    return best.tvmaze_id, best.imdb
 end
 
 -- ── TVMaze : episode absolu → numero RELATIF ───────────────
---
---  Retourne uniquement le champ "number" de l'episode (position
---  relative dans son groupe/saison TVMaze), pas le numero de saison
---  TVMaze (qui peut etre une annee comme 2014).
---
 local function tvmaze_get_relative_ep(tvmaze_id, abs_episode)
     local url  = string.format(TVMAZE_EPISODES, tvmaze_id)
     local body = http_get(url)
@@ -274,30 +274,11 @@ local function tvmaze_get_relative_ep(tvmaze_id, abs_episode)
 end
 
 -- ── IntroDB : timestamps intro ─────────────────────────────
---
---  Reponse reelle de l'API :
---  {
---    "imdb_id": "tt0388629",
---    "season": 16, "episode": 23,
---    "intro": {
---      "start_sec": 4.774,
---      "end_sec":   94.774,
---      "start_ms":  4774,
---      "end_ms":    94774,
---      "confidence": 1,
---      ...
---    },
---    "recap": null,
---    "outro": null
---  }
---
 local function fetch_intro_timestamps(imdb_id, season, episode)
     local url  = string.format(INTRODB_URL, imdb_id, season, episode)
     local body = http_get(url)
     if not body or body == "" then return nil, nil end
 
-    -- Isoler le bloc "intro": { ... }
-    -- On verifie d'abord que "intro" n'est pas null
     if body:match('"intro"%s*:%s*null') then
         log("info", "IntroDB : intro = null pour %s S%02dE%02d",
             imdb_id, season, episode)
@@ -312,7 +293,6 @@ local function fetch_intro_timestamps(imdb_id, season, episode)
         return nil, nil
     end
 
-    -- Les timestamps sont en "start_sec" / "end_sec" (secondes, float)
     local t_start = jget_num(intro_block, "start_sec")
     local t_end   = jget_num(intro_block, "end_sec")
 
@@ -379,16 +359,12 @@ local function on_file_loaded()
     end
 
     mp.add_timeout(0, function()
-        -- Etape 1 : TVMaze -> show ID + imdbID
         local tvmaze_id, imdb_id = tvmaze_search(show_name)
         if not imdb_id then return end
 
         local final_season  = folder_season
         local final_episode = episode
 
-        -- Etape 2 : si episode absolu, obtenir le numero relatif via TVMaze
-        --   Saison  = dossier parent  (ex: 16)
-        --   Episode = position dans l'arc selon TVMaze (ex: 23)
         if is_absolute then
             log("info", "Conversion E%d absolu -> relatif via TVMaze...", episode)
             local rel_ep = tvmaze_get_relative_ep(tvmaze_id, episode)
@@ -402,7 +378,6 @@ local function on_file_loaded()
             end
         end
 
-        -- Etape 3 : IntroDB -> timestamps
         local t_start, t_end =
             fetch_intro_timestamps(imdb_id, final_season, final_episode)
         if not t_start or not t_end then return end
